@@ -3,99 +3,56 @@ package main
 import (
 	"context"
 	"fmt"
-	"math"
-	"net/http"
-	"os"
-	"strconv"
-	"strings"
+	"log"
 
-	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/JuanSuarez-dev/truora-stocks-backend/models"
+	"github.com/JuanSuarez-dev/truora-stocks-backend/config"
+	"github.com/JuanSuarez-dev/truora-stocks-backend/db"
+	"github.com/JuanSuarez-dev/truora-stocks-backend/fetch"
 )
 
-func parseDollar(s string) float64 {
-	clean := strings.ReplaceAll(strings.ReplaceAll(s, "$", ""), ",", "")
-	v, err := strconv.ParseFloat(clean, 64)
-	if err != nil {
-		return math.NaN()
-	}
-	return v
-}
-
 func main() {
-	// Conexión a CockroachDB
-	dsn := os.Getenv("COCKROACH_DSN")
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		panic(err)
-	}
+	// 1) Carga la configuración (.env o env vars)
+	cfg := config.Load()
+
+	// 2) Conecta a CockroachDB
+	pool := db.Connect(cfg.CockroachDSN)
 	defer pool.Close()
 
-	r := gin.Default()
+	// 3) Paginación + upsert
+	baseURL := "https://8j5baasof2.execute-api.us-west-2.amazonaws.com/production/swechallenge/list"
+	next := baseURL
 
-	// 1) List all stocks
-	r.GET("/api/stocks", func(c *gin.Context) {
-		rows, err := pool.Query(context.Background(), `
-      SELECT ticker, company, brokerage, action,
-             rating_from, rating_to,
-             target_from, target_to, time
-      FROM stocks
-      ORDER BY ticker
-    `)
+	for next != "" {
+		apiResp, err := fetch.FetchPage(cfg.APIToken, next)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
+			log.Fatalf("❌ FetchPage error: %v", err)
 		}
-		defer rows.Close()
+		fmt.Printf("→ %d items, next_page=%q\n", len(apiResp.Items), apiResp.NextPage)
 
-		var list []models.StockItem
-		for rows.Next() {
-			var it models.StockItem
-			rows.Scan(&it.Ticker, &it.Company, &it.Brokerage, &it.Action,
-				&it.RatingFrom, &it.RatingTo, &it.TargetFrom, &it.TargetTo, &it.Time)
-			list = append(list, it)
-		}
-		c.JSON(http.StatusOK, list)
-	})
-
-	// 2) Best pick endpoint
-	r.GET("/api/stocks/best", func(c *gin.Context) {
-		rows, err := pool.Query(context.Background(), `
-      SELECT ticker, target_from, target_to FROM stocks
-    `)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		defer rows.Close()
-
-		bestTicker := ""
-		bestUpside := -math.MaxFloat64
-
-		for rows.Next() {
-			var ticker, fromS, toS string
-			rows.Scan(&ticker, &fromS, &toS)
-
-			from := parseDollar(fromS)
-			to := parseDollar(toS)
-			if from == 0 || math.IsNaN(from) {
-				continue
-			}
-			upside := (to - from) / from * 100
-			if upside > bestUpside {
-				bestUpside = upside
-				bestTicker = ticker
+		for _, it := range apiResp.Items {
+			_, err := pool.Exec(context.Background(), `
+        INSERT INTO stocks (
+          ticker, company, brokerage, action,
+          rating_from, rating_to, target_from, target_to, time
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        ON CONFLICT (ticker) DO UPDATE SET
+          company     = EXCLUDED.company,
+          brokerage   = EXCLUDED.brokerage,
+          action      = EXCLUDED.action,
+          rating_from = EXCLUDED.rating_from,
+          rating_to   = EXCLUDED.rating_to,
+          target_from = EXCLUDED.target_from,
+          target_to   = EXCLUDED.target_to,
+          time        = EXCLUDED.time
+      `, it.Ticker, it.Company, it.Brokerage, it.Action,
+				it.RatingFrom, it.RatingTo, it.TargetFrom, it.TargetTo, it.Time)
+			if err != nil {
+				log.Printf("⚠️ upsert %s: %v", it.Ticker, err)
 			}
 		}
 
-		c.JSON(http.StatusOK, gin.H{
-			"ticker": bestTicker,
-			"upside": fmt.Sprintf("%.1f%%", bestUpside),
-		})
-	})
+		next = apiResp.NextPage
+	}
 
-	// Inicia servidor
-	r.Run(":8080")
+	fmt.Println("✅ Part 1 done: all data stored in CockroachDB")
 }

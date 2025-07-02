@@ -6,35 +6,17 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"strconv"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/JuanSuarez-dev/truora-stocks-backend/models"
 )
 
-func parseDollar(s string) float64 {
-	clean := strings.ReplaceAll(strings.ReplaceAll(s, "$", ""), ",", "")
-	v, err := strconv.ParseFloat(clean, 64)
-	if err != nil {
-		return math.NaN()
-	}
-	return v
-}
 
-func main() {
-	// Leer la DSN de CockroachDB desde la variable de entorno
-	dsn := os.Getenv("COCKROACH_DSN")
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		panic(err)
-	}
-	defer pool.Close()
-
-	r := gin.Default()
-
-	// Endpoint: lista todos los stocks
+// RegisterRoutes monta todos los endpoints sobre el router r
+func RegisterRoutes(r *gin.Engine, pool *pgxpool.Pool) {
+	// 1) List all stocks
 	r.GET("/api/stocks", func(c *gin.Context) {
 		rows, err := pool.Query(context.Background(), `
       SELECT ticker, company, brokerage, action,
@@ -59,7 +41,7 @@ func main() {
 		c.JSON(http.StatusOK, list)
 	})
 
-	// Endpoint: mejor recomendación (mayor upside)
+	// 2) Best pick
 	r.GET("/api/stocks/best", func(c *gin.Context) {
 		rows, err := pool.Query(context.Background(), `
       SELECT ticker, target_from, target_to FROM stocks
@@ -72,7 +54,6 @@ func main() {
 
 		bestTicker := ""
 		bestUpside := -math.MaxFloat64
-
 		for rows.Next() {
 			var ticker, fromS, toS string
 			rows.Scan(&ticker, &fromS, &toS)
@@ -82,7 +63,6 @@ func main() {
 			if from == 0 || math.IsNaN(from) {
 				continue
 			}
-
 			upside := (to - from) / from * 100
 			if upside > bestUpside {
 				bestUpside = upside
@@ -95,7 +75,18 @@ func main() {
 			"upside": fmt.Sprintf("%.1f%%", bestUpside),
 		})
 	})
+}
 
-	// Inicia el servidor en el puerto 8080
-	r.Run(":8080")
+func main() {
+	// Leer .env o env
+	dsn := os.Getenv("COCKROACH_DSN")
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		panic(err)
+	}
+	defer pool.Close()
+
+	r := gin.Default()
+	RegisterRoutes(r, pool)      // monta todos los endpoints
+	r.Run(":8080")               // arranca
 }
